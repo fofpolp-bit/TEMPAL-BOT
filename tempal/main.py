@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiohttp import web
 
 from .config import load_settings
 from .game.storage import build_store
@@ -57,6 +59,21 @@ async def amain() -> None:
     dp.include_router(gameplay_router)
     dp.include_router(admin_router)
     dp.include_router(info_router)
+
+    port_env = os.environ.get("PORT")
+    if port_env:
+        app = web.Application()
+
+        async def health(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(port_env))
+        await site.start()
+        logger.info("HTTP healthcheck listening on :%s", port_env)
 
     logger.info("Тempal bot is up. Polling…")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
