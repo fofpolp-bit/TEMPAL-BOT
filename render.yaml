@@ -1,0 +1,27 @@
+# Render.com Blueprint for Tempal bot.
+# After pushing this file to GitHub, create a new Blueprint in Render and point
+# it at this repo. Render will provision the worker automatically. You'll still
+# need to set TELEGRAM_BOT_TOKEN, DATABASE_URL (Neon), and ALLOWED_CHAT_IDS as
+# env vars on the service.
+
+services:
+  - type: worker
+    name: tempal-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    branch: main
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m tempal.main
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ALLOWED_CHAT_IDS
+        sync: false
+      - key: OPERATE_CHAT_IDS
+        sync: false
