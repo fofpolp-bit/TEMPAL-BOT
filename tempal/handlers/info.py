@@ -5,9 +5,11 @@ from __future__ import annotations
 import io
 import logging
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InputMediaPhoto, Message
+
+from ..services.chronicle import build_match_chronicle
 
 from ..game.models import GameStatus, LifetimeProfile, TeamId
 from ..services.cards import render_card, render_card_text, render_profile, render_profile_text
@@ -120,3 +122,57 @@ async def cmd_card(message: Message, bot: Bot, **kwargs) -> None:
         )
     except Exception:
         await message.answer(text, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "end:chronicle")
+async def cb_end_chronicle(call: CallbackQuery, **kwargs) -> None:
+    """Re-post the chronicle text when the post-match button is pressed."""
+    ctx: BotContext = get_context(kwargs)
+    game = ctx.store.get(call.message.chat.id)
+    if not game or not game.chronicle:
+        await call.answer("Хроника этого матча уже не доступна.", show_alert=True)
+        return
+    await call.message.answer(build_match_chronicle(game), parse_mode="HTML")
+    await call.answer()
+
+
+@router.callback_query(F.data == "end:cards")
+async def cb_end_cards(call: CallbackQuery, bot: Bot, **kwargs) -> None:
+    """Send PNG cards for every player who actually played the match."""
+    ctx: BotContext = get_context(kwargs)
+    game = ctx.store.get(call.message.chat.id)
+    if not game:
+        await call.answer("Карточки этого матча уже не доступны.", show_alert=True)
+        return
+    eligible = [p for p in game.players.values() if p.is_eligible()]
+    if not eligible:
+        await call.answer("Нет игроков, которым можно показать карточки.", show_alert=True)
+        return
+    await call.answer()
+    # Try sending up to 10 as a single album; fall back to one-by-one if a
+    # card fails to render (we still want the rest to come through).
+    media: list[InputMediaPhoto] = []
+    fallbacks: list[tuple[str, str]] = []  # (caption, png-failure name)
+    for p in eligible[:10]:
+        try:
+            png = render_card(p)
+            media.append(
+                InputMediaPhoto(
+                    media=BufferedInputFile(png, filename=f"card_{p.user_id}.png"),
+                    caption=render_card_text(p) if len(media) == 0 else None,
+                    parse_mode="HTML" if len(media) == 0 else None,
+                )
+            )
+        except Exception:
+            logger.exception("render_card failed for player %s", p.user_id)
+            fallbacks.append((render_card_text(p), p.name))
+    if media:
+        try:
+            await bot.send_media_group(chat_id=call.message.chat.id, media=media)
+        except Exception:
+            logger.exception("send_media_group failed; falling back to text cards")
+            for p in eligible:
+                await call.message.answer(render_card_text(p), parse_mode="HTML")
+            return
+    for caption, _ in fallbacks:
+        await call.message.answer(caption, parse_mode="HTML")

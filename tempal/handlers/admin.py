@@ -11,6 +11,7 @@ from aiogram.types import Message
 from ..game.models import GameStatus
 from ..services.chronicle import build_match_chronicle
 from .common import BotContext, get_context, is_group_owner_or_admin
+from .keyboards import end_game_keyboard
 
 router = Router(name="admin")
 
@@ -110,5 +111,10 @@ async def cmd_endgame(message: Message, bot: Bot, **kwargs) -> None:
 
     record_profiles_for_match(ctx.profiles, game)
     ctx.store.put(game)
-    await message.answer(build_match_chronicle(game), parse_mode="HTML")
-    ctx.store.delete(game.chat_id)
+    # Keep the finished game in the store so the chronicle / cards buttons
+    # below still work. The next /newgame in this chat will overwrite it.
+    await message.answer(
+        build_match_chronicle(game),
+        parse_mode="HTML",
+        reply_markup=end_game_keyboard(),
+    )
