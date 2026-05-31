@@ -53,6 +53,43 @@ async def cmd_resume(message: Message, bot: Bot, **kwargs) -> None:
     await message.answer("▶️ Матч возобновлён.")
 
 
+@router.message(Command("skip"))
+async def cmd_skip(message: Message, bot: Bot, **kwargs) -> None:
+    """Force-reannounce the current round.
+
+    Use this if the bot gets stuck mid-animation or skips the round header
+    after a previous flood-control hiccup. Owner / group admin only.
+    """
+    ctx: BotContext = get_context(kwargs)
+    game = ctx.store.get(message.chat.id)
+    if not game or game.status is not GameStatus.PLAYING:
+        await message.answer("Сейчас нет активного раунда — пропускать нечего.")
+        return
+    allowed = (
+        message.from_user.id == game.owner_id
+        or await is_group_owner_or_admin(bot, message.chat.id, message.from_user.id)
+    )
+    if not allowed:
+        await message.answer(
+            "Команду /skip может вызвать только владелец группы или создатель лобби."
+        )
+        return
+    # Wipe any half-collected actions/notes for the current round and
+    # re-issue the round header + action prompts. The actual game logic
+    # is unchanged — only the round bootstrap is replayed.
+    game.pending_actions = {}
+    game.round_rp_notes = {}
+    ctx.store.put(game)
+    from .gameplay import start_round, _STATUS_MSG_IDS
+
+    _STATUS_MSG_IDS.pop(game.chat_id, None)
+    await message.answer(
+        f"⏭ Перезапускаю раунд <b>{game.current_round}</b>…",
+        parse_mode="HTML",
+    )
+    await start_round(bot, ctx, game)
+
+
 @router.message(Command("endgame"))
 async def cmd_endgame(message: Message, bot: Bot, **kwargs) -> None:
     ctx: BotContext = get_context(kwargs)
