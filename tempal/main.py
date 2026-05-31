@@ -16,6 +16,7 @@ from .game.storage import build_store
 from .handlers import admin_router, gameplay_router, info_router, lobby_router
 from .handlers.common import BotContext
 from .middleware import ContextMiddleware, ChatAccessMiddleware
+from .services.retry_middleware import RetryAfterMiddleware
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,7 @@ async def amain() -> None:
         settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    bot.session.middleware(RetryAfterMiddleware())
     dp = Dispatcher()
 
     context_mw = ContextMiddleware(ctx)
