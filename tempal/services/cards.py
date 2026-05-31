@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 from ..config import FONTS_DIR
 from ..game.abilities import get_ability
 from ..game.achievements import ACHIEVEMENTS, get_achievement
-from ..game.models import Player, TEAM_EMOJI, TEAM_LABEL, TeamId
+from ..game.models import LifetimeProfile, Player, TEAM_EMOJI, TEAM_LABEL, TeamId
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,144 @@ def render_card(player: Player) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+PROFILE_GRADIENT = ((70, 50, 30), (25, 18, 10))  # warm bronze
+ACCENT_BRONZE = (205, 130, 60)
+
+
+def render_profile(profile: LifetimeProfile) -> bytes:
+    """Render the out-of-game career card to PNG bytes."""
+    img = _vertical_gradient((CARD_WIDTH, CARD_HEIGHT), *PROFILE_GRADIENT)
+    draw = ImageDraw.Draw(img)
+
+    draw.rectangle([(8, 8), (CARD_WIDTH - 9, CARD_HEIGHT - 9)], outline="white", width=2)
+    draw.rectangle(
+        [(14, 14), (CARD_WIDTH - 15, CARD_HEIGHT - 15)],
+        outline=ACCENT_BRONZE,
+        width=1,
+    )
+
+    title_font = _font(36, bold=True)
+    body_font = _font(24)
+    small_font = _font(20)
+    micro_font = _font(16)
+
+    draw.text((36, 28), "ТЕМПОРАЛЬНЫЙ ДОСЬЕ", font=title_font, fill="white")
+    draw.text(
+        (36, 78),
+        profile.name or f"Игрок #{profile.user_id}",
+        font=_font(32, bold=True),
+        fill="white",
+    )
+
+    # Career line
+    ratio = (
+        f"{profile.matches_won}/{profile.matches_played}"
+        if profile.matches_played
+        else "ещё нет матчей"
+    )
+    draw.text(
+        (36, 130),
+        f"Матчей сыграно: {profile.matches_played}   ·   Побед: {ratio}",
+        font=body_font,
+        fill="white",
+    )
+
+    # Lifetime stats grid (two columns)
+    stats_left = [
+        ("Сфер взято", profile.total_sphere_captures),
+        ("Натуральных 20", profile.total_nat20s),
+        ("Натуральных 10", profile.total_nat10s),
+        ("Натуральных 1", profile.total_nat1s),
+    ]
+    stats_right = [
+        ("Заморозок", profile.total_successful_freezes),
+        ("Способностей", profile.total_successful_ability_uses),
+        ("Пасов", profile.total_passes),
+        ("Раз заморожен", profile.total_times_fully_frozen),
+    ]
+    base_y = 175
+    for i, (label, value) in enumerate(stats_left):
+        draw.text((36, base_y + i * 28), f"{label}: {value}", font=small_font, fill="white")
+    for i, (label, value) in enumerate(stats_right):
+        draw.text(
+            (CARD_WIDTH // 2, base_y + i * 28),
+            f"{label}: {value}",
+            font=small_font,
+            fill="white",
+        )
+
+    # Bronzes
+    if profile.achievement_counts:
+        items = sorted(
+            profile.achievement_counts.items(), key=lambda kv: -kv[1]
+        )
+        names = []
+        for ach_id, count in items:
+            if ach_id not in ACHIEVEMENTS:
+                continue
+            a = get_achievement(ach_id)
+            names.append(f"{a.name} ×{count}" if count > 1 else a.name)
+        if names:
+            line = "🥉 Бронзы: " + ", ".join(names)
+            wrapped = textwrap.wrap(line, width=64)
+            for i, w in enumerate(wrapped[:3]):
+                draw.text(
+                    (36, CARD_HEIGHT - 80 + i * 22),
+                    w,
+                    font=micro_font,
+                    fill=(255, 220, 160),
+                )
+    else:
+        draw.text(
+            (36, CARD_HEIGHT - 50),
+            "🥉 Бронзы пока пустые — пора в матч.",
+            font=small_font,
+            fill=(220, 200, 160),
+        )
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def render_profile_text(profile: LifetimeProfile) -> str:
+    """Fallback HTML text rendering of the lifetime profile."""
+    lines = ["📜 <b>ТЕМПОРАЛЬНЫЙ ДОСЬЕ</b>"]
+    lines.append(f"<b>{profile.name or f'Игрок #{profile.user_id}'}</b>")
+    if profile.matches_played:
+        lines.append(
+            f"Матчей: <b>{profile.matches_played}</b> · "
+            f"Побед: <b>{profile.matches_won}</b>"
+        )
+    else:
+        lines.append("<i>Ещё ни одного завершённого матча.</i>")
+    lines.append("")
+    lines.append(
+        f"Сфер взято: <b>{profile.total_sphere_captures}</b> · "
+        f"Нат. 20: <b>{profile.total_nat20s}</b> · "
+        f"Нат. 10: <b>{profile.total_nat10s}</b> · "
+        f"Нат. 1: <b>{profile.total_nat1s}</b>"
+    )
+    lines.append(
+        f"Заморозок: <b>{profile.total_successful_freezes}</b> · "
+        f"Способностей: <b>{profile.total_successful_ability_uses}</b> · "
+        f"Пасов: <b>{profile.total_passes}</b> · "
+        f"Раз заморожен(а): <b>{profile.total_times_fully_frozen}</b>"
+    )
+    if profile.achievement_counts:
+        ach_parts = []
+        for ach_id, count in sorted(profile.achievement_counts.items(), key=lambda kv: -kv[1]):
+            if ach_id not in ACHIEVEMENTS:
+                continue
+            a = get_achievement(ach_id)
+            tag = f"{a.emoji} {a.name}"
+            ach_parts.append(f"{tag}×{count}" if count > 1 else tag)
+        if ach_parts:
+            lines.append("")
+            lines.append("🥉 <b>Бронзы:</b> " + ", ".join(ach_parts))
+    return "\n".join(lines)
 
 
 def render_card_text(player: Player) -> str:

@@ -12,7 +12,7 @@ from aiogram.enums import ParseMode
 from aiohttp import web
 
 from .config import load_settings
-from .game.storage import build_store
+from .game.storage import build_profile_store, build_store
 from .handlers import admin_router, gameplay_router, info_router, lobby_router
 from .handlers.common import BotContext
 from .middleware import ContextMiddleware, ChatAccessMiddleware
@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 async def amain() -> None:
     settings = load_settings()
     store = build_store(settings.database_url, settings.state_file)
-    ctx = BotContext(settings=settings, store=store)
+    profiles = build_profile_store(settings.database_url, settings.state_file)
+    ctx = BotContext(settings=settings, store=store, profiles=profiles)
 
     bot = Bot(
         settings.bot_token,

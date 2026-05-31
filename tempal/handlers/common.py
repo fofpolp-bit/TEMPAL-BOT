@@ -11,7 +11,7 @@ from aiogram import Bot
 
 from ..config import Settings
 from ..game.models import Game, TEAM_LABEL, TeamId
-from ..game.storage import GameStore
+from ..game.storage import GameStore, ProfileStore
 from ..services.arena_map import render_with_legend
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ class BotContext:
 
     settings: Settings
     store: GameStore
+    profiles: ProfileStore
 
 
 def get_context(data: dict) -> BotContext:

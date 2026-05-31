@@ -534,6 +534,9 @@ async def _force_resolve(bot: Bot, ctx: BotContext, game: Game) -> None:
         game.status = GameStatus.FINISHED
         game.winner = resolution.winner
         game.finished_at = time.time()
+        from ..game.storage import record_profiles_for_match
+
+        record_profiles_for_match(ctx.profiles, game)
         ctx.store.put(game)
         await bot.send_message(
             game.chat_id,

@@ -23,6 +23,7 @@ from .models import (
     ChaosState,
     Game,
     GameStatus,
+    LifetimeProfile,
     PendingAction,
     Player,
     RoundOutcome,
@@ -145,7 +146,30 @@ def _game_from_dict(data: dict[str, Any]) -> Game:
     g.created_at = data.get("created_at", 0.0)
     g.finished_at = data.get("finished_at")
     g.winner = TeamId(data["winner"]) if data.get("winner") else None
+    g.profiles_recorded = bool(data.get("profiles_recorded", False))
     return g
+
+
+def _profile_from_dict(data: dict[str, Any]) -> LifetimeProfile:
+    return LifetimeProfile(
+        user_id=int(data["user_id"]),
+        name=data.get("name", ""),
+        matches_played=int(data.get("matches_played", 0)),
+        matches_won=int(data.get("matches_won", 0)),
+        total_personal_score=int(data.get("total_personal_score", 0)),
+        total_sphere_captures=int(data.get("total_sphere_captures", 0)),
+        total_nat20s=int(data.get("total_nat20s", 0)),
+        total_nat1s=int(data.get("total_nat1s", 0)),
+        total_nat10s=int(data.get("total_nat10s", 0)),
+        total_successful_freezes=int(data.get("total_successful_freezes", 0)),
+        total_successful_ability_uses=int(data.get("total_successful_ability_uses", 0)),
+        total_passes=int(data.get("total_passes", 0)),
+        total_times_fully_frozen=int(data.get("total_times_fully_frozen", 0)),
+        achievement_counts={
+            str(k): int(v) for k, v in (data.get("achievement_counts") or {}).items()
+        },
+        last_updated=float(data.get("last_updated", 0.0)),
+    )
 
 
 class JsonGameStore:
@@ -287,6 +311,165 @@ class PostgresGameStore:
         return list(self._games.values())
 
 
+def accumulate_into_profile(
+    profile: LifetimeProfile, player: Player, *, is_winner: bool, when: float
+) -> None:
+    """Fold a single match's per-player counters into the lifetime profile.
+
+    Always mutates ``profile`` in place — callers must persist the result.
+    """
+    profile.name = player.name or profile.name
+    profile.matches_played += 1
+    if is_winner:
+        profile.matches_won += 1
+    profile.total_personal_score += player.personal_score
+    profile.total_sphere_captures += player.sphere_captures
+    profile.total_nat20s += player.nat20s
+    profile.total_nat1s += player.nat1s
+    profile.total_nat10s += player.nat10s
+    profile.total_successful_freezes += player.successful_freezes
+    profile.total_successful_ability_uses += player.successful_ability_uses
+    profile.total_passes += player.pass_count
+    profile.total_times_fully_frozen += player.times_fully_frozen
+    for ach_id in player.earned_achievements:
+        profile.achievement_counts[ach_id] = (
+            profile.achievement_counts.get(ach_id, 0) + 1
+        )
+    profile.last_updated = when
+
+
+class JsonProfileStore:
+    """Single-file JSON store for lifetime profiles (local dev / fallback)."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._profiles: dict[int, LifetimeProfile] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self._path.exists():
+            self._profiles = {}
+            return
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception(
+                "Failed to read profiles file %s — starting empty", self._path
+            )
+            self._profiles = {}
+            return
+        self._profiles = {
+            int(uid): _profile_from_dict(blob)
+            for uid, blob in raw.get("profiles", {}).items()
+        }
+
+    def save(self) -> None:
+        serialised = {
+            "profiles": {
+                str(uid): _to_jsonable(p) for uid, p in self._profiles.items()
+            }
+        }
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=self._path.parent, prefix=".profiles-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(serialised, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._path)
+        except Exception:
+            logger.exception("Failed to save profiles")
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def get(self, user_id: int) -> LifetimeProfile | None:
+        return self._profiles.get(user_id)
+
+    def put(self, profile: LifetimeProfile) -> None:
+        self._profiles[profile.user_id] = profile
+        self.save()
+
+
+class PostgresProfileStore:
+    """Postgres-backed lifetime profile store. One JSONB row per Telegram user.
+
+    Designed to share connection semantics with PostgresGameStore — both stores
+    are independent so reads/writes never interfere.
+    """
+
+    SCHEMA = """
+        CREATE TABLE IF NOT EXISTS tempal_profiles (
+            user_id     BIGINT PRIMARY KEY,
+            data        JSONB NOT NULL,
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """
+
+    def __init__(self, dsn: str) -> None:
+        import psycopg  # type: ignore[import-not-found]
+
+        self._dsn = dsn
+        self._psycopg = psycopg
+        self._profiles: dict[int, LifetimeProfile] = {}
+        self._ensure_schema()
+        self.load()
+
+    def _connect(self):
+        return self._psycopg.connect(self._dsn, autocommit=True)
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(self.SCHEMA)
+
+    def load(self) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT user_id, data FROM tempal_profiles")
+            rows = cur.fetchall()
+        out: dict[int, LifetimeProfile] = {}
+        for uid, blob in rows:
+            try:
+                out[int(uid)] = _profile_from_dict(blob)
+            except Exception:
+                logger.exception("Failed to deserialise profile for user %s", uid)
+        self._profiles = out
+        logger.info("Loaded %d lifetime profile(s) from Postgres", len(out))
+
+    def _persist(self, user_id: int, profile: LifetimeProfile) -> None:
+        from psycopg.types.json import Jsonb  # type: ignore[import-not-found]
+
+        payload = _to_jsonable(profile)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tempal_profiles (user_id, data, updated_at)
+                VALUES (%s, %s, now())
+                ON CONFLICT (user_id)
+                DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+                """,
+                (user_id, Jsonb(payload)),
+            )
+
+    def get(self, user_id: int) -> LifetimeProfile | None:
+        return self._profiles.get(user_id)
+
+    def put(self, profile: LifetimeProfile) -> None:
+        self._profiles[profile.user_id] = profile
+        try:
+            self._persist(profile.user_id, profile)
+        except Exception:
+            logger.exception("Failed to persist profile to Postgres")
+
+
+def build_profile_store(database_url: str, state_file: Path):
+    """Mirror of ``build_store`` for the LifetimeProfile table."""
+    if database_url:
+        logger.info("Using Postgres profile store")
+        return PostgresProfileStore(database_url)
+    profile_path = state_file.with_name("profiles.json")
+    logger.info("Using JSON profile store at %s", profile_path)
+    return JsonProfileStore(profile_path)
+
+
 def build_store(database_url: str, state_file: Path):
     """Pick the right backend based on whether DATABASE_URL is set."""
     if database_url:
@@ -314,3 +497,30 @@ def build_store(database_url: str, state_file: Path):
 
 # Backwards-compat alias — keep `GameStore` name for callers that imported it.
 GameStore = JsonGameStore
+ProfileStore = JsonProfileStore
+
+
+def record_profiles_for_match(store: "ProfileStore", game: Game) -> None:
+    """Fold every eligible player's match stats into their lifetime profile.
+
+    Idempotent — does nothing if ``game.profiles_recorded`` is already set.
+    Mutates the flag on the passed game so callers should persist it afterwards.
+    """
+    import time as _time
+
+    if game.profiles_recorded:
+        return
+    when = _time.time()
+    for player in game.players.values():
+        if player.is_spare or player.team_id is None:
+            # Spares never actually played a match — don't pollute their lifetime.
+            continue
+        profile = store.get(player.user_id) or LifetimeProfile(user_id=player.user_id)
+        accumulate_into_profile(
+            profile,
+            player,
+            is_winner=(game.winner is not None and player.team_id == game.winner),
+            when=when,
+        )
+        store.put(profile)
+    game.profiles_recorded = True

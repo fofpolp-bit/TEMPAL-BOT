@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import io
+import logging
 
 from aiogram import Bot, Router
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 
-from ..game.models import GameStatus, TeamId
-from ..services.cards import render_card, render_card_text
+from ..game.models import GameStatus, LifetimeProfile, TeamId
+from ..services.cards import render_card, render_card_text, render_profile, render_profile_text
 from .common import BotContext, fmt_player_name, format_round_header, format_scoreboard, get_context
 
+logger = logging.getLogger(__name__)
 router = Router(name="info")
 
 
@@ -56,6 +58,35 @@ async def cmd_score(message: Message, **kwargs) -> None:
         await message.answer("Здесь нет матча.")
         return
     await message.answer(format_scoreboard(game), parse_mode="HTML")
+
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message, bot: Bot, **kwargs) -> None:
+    """Out-of-game career profile: lifetime stats, wins, bronze achievements."""
+    ctx: BotContext = get_context(kwargs)
+    target_user = message.from_user
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_user = message.reply_to_message.from_user
+
+    profile = ctx.profiles.get(target_user.id)
+    if profile is None:
+        profile = LifetimeProfile(
+            user_id=target_user.id,
+            name=target_user.full_name or "",
+        )
+
+    text = render_profile_text(profile)
+    try:
+        png = render_profile(profile)
+        await bot.send_photo(
+            chat_id=message.chat.id,
+            photo=BufferedInputFile(png, filename=f"profile_{target_user.id}.png"),
+            caption=text,
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("render_profile failed for user %s", target_user.id)
+        await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("card"))

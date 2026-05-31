@@ -34,6 +34,32 @@ class ActionKind(str, Enum):
 
 
 @dataclass
+class LifetimeProfile:
+    """Per-user career stats aggregated across every match they played.
+
+    Lives in its own Postgres table, keyed by Telegram user_id. Updated once
+    per finished match — see ``storage.accumulate_into_profile``.
+    """
+
+    user_id: int
+    name: str = ""  # last seen display name; refreshed every aggregate
+    matches_played: int = 0
+    matches_won: int = 0
+    total_personal_score: int = 0
+    total_sphere_captures: int = 0
+    total_nat20s: int = 0
+    total_nat1s: int = 0
+    total_nat10s: int = 0
+    total_successful_freezes: int = 0
+    total_successful_ability_uses: int = 0
+    total_passes: int = 0
+    total_times_fully_frozen: int = 0
+    # Number of times each achievement_id was earned across matches.
+    achievement_counts: dict[str, int] = field(default_factory=dict)
+    last_updated: float = 0.0
+
+
+@dataclass
 class Player:
     user_id: int
     name: str
@@ -151,6 +177,9 @@ class Game:
     created_at: float = 0.0
     finished_at: Optional[float] = None
     winner: Optional[TeamId] = None
+    # Set to True after this match's stats have been folded into every
+    # participant's LifetimeProfile, so /endgame can't double-count.
+    profiles_recorded: bool = False
 
     # ── helpers ─────────────────────────────────────────────────────────
     @property

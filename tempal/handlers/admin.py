@@ -106,6 +106,9 @@ async def cmd_endgame(message: Message, bot: Bot, **kwargs) -> None:
         return
     game.status = GameStatus.FINISHED
     game.finished_at = time.time()
+    from ..game.storage import record_profiles_for_match
+
+    record_profiles_for_match(ctx.profiles, game)
     ctx.store.put(game)
     await message.answer(build_match_chronicle(game), parse_mode="HTML")
     ctx.store.delete(game.chat_id)
