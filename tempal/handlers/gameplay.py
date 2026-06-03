@@ -538,6 +538,8 @@ async def _force_resolve(bot: Bot, ctx: BotContext, game: Game) -> None:
 
         record_profiles_for_match(ctx.profiles, game)
         ctx.store.put(game)
+        # Per-chat snapshot of the last finished match — survives /newgame.
+        ctx.last_match.put(game)
         await bot.send_message(
             game.chat_id,
             build_match_chronicle(game),

@@ -168,6 +168,7 @@ def _profile_from_dict(data: dict[str, Any]) -> LifetimeProfile:
         achievement_counts={
             str(k): int(v) for k, v in (data.get("achievement_counts") or {}).items()
         },
+        chat_ids=[int(c) for c in (data.get("chat_ids") or [])],
         last_updated=float(data.get("last_updated", 0.0)),
     )
 
@@ -312,7 +313,12 @@ class PostgresGameStore:
 
 
 def accumulate_into_profile(
-    profile: LifetimeProfile, player: Player, *, is_winner: bool, when: float
+    profile: LifetimeProfile,
+    player: Player,
+    *,
+    is_winner: bool,
+    when: float,
+    chat_id: int | None = None,
 ) -> None:
     """Fold a single match's per-player counters into the lifetime profile.
 
@@ -335,6 +341,8 @@ def accumulate_into_profile(
         profile.achievement_counts[ach_id] = (
             profile.achievement_counts.get(ach_id, 0) + 1
         )
+    if chat_id is not None and chat_id not in profile.chat_ids:
+        profile.chat_ids.append(chat_id)
     profile.last_updated = when
 
 
@@ -388,6 +396,9 @@ class JsonProfileStore:
     def put(self, profile: LifetimeProfile) -> None:
         self._profiles[profile.user_id] = profile
         self.save()
+
+    def all_profiles(self) -> list[LifetimeProfile]:
+        return list(self._profiles.values())
 
 
 class PostgresProfileStore:
@@ -459,6 +470,138 @@ class PostgresProfileStore:
         except Exception:
             logger.exception("Failed to persist profile to Postgres")
 
+    def all_profiles(self) -> list[LifetimeProfile]:
+        return list(self._profiles.values())
+
+
+class JsonLastMatchStore:
+    """Per-chat snapshot of the *last finished* match (JSON backend)."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._games: dict[int, Game] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self._path.exists():
+            self._games = {}
+            return
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception(
+                "Failed to read last-match file %s — starting empty", self._path
+            )
+            self._games = {}
+            return
+        self._games = {
+            int(cid): _game_from_dict(blob)
+            for cid, blob in raw.get("games", {}).items()
+        }
+
+    def save(self) -> None:
+        serialised = {
+            "games": {
+                str(cid): _to_jsonable(g) for cid, g in self._games.items()
+            }
+        }
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=self._path.parent, prefix=".lastmatch-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(serialised, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._path)
+        except Exception:
+            logger.exception("Failed to save last-match snapshot")
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def get(self, chat_id: int) -> Game | None:
+        return self._games.get(chat_id)
+
+    def put(self, game: Game) -> None:
+        self._games[game.chat_id] = game
+        self.save()
+
+
+class PostgresLastMatchStore:
+    """Postgres-backed per-chat last-finished-match snapshot."""
+
+    SCHEMA = """
+        CREATE TABLE IF NOT EXISTS tempal_last_match (
+            chat_id     BIGINT PRIMARY KEY,
+            data        JSONB NOT NULL,
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """
+
+    def __init__(self, dsn: str) -> None:
+        import psycopg  # type: ignore[import-not-found]
+
+        self._dsn = dsn
+        self._psycopg = psycopg
+        self._games: dict[int, Game] = {}
+        self._ensure_schema()
+        self.load()
+
+    def _connect(self):
+        return self._psycopg.connect(self._dsn, autocommit=True)
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(self.SCHEMA)
+
+    def load(self) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT chat_id, data FROM tempal_last_match")
+            rows = cur.fetchall()
+        out: dict[int, Game] = {}
+        for chat_id, blob in rows:
+            try:
+                out[int(chat_id)] = _game_from_dict(blob)
+            except Exception:
+                logger.exception(
+                    "Failed to deserialise last-match for chat %s", chat_id
+                )
+        self._games = out
+        logger.info("Loaded %d last-match snapshot(s) from Postgres", len(out))
+
+    def _persist(self, chat_id: int, game: Game) -> None:
+        from psycopg.types.json import Jsonb  # type: ignore[import-not-found]
+
+        payload = _to_jsonable(game)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tempal_last_match (chat_id, data, updated_at)
+                VALUES (%s, %s, now())
+                ON CONFLICT (chat_id)
+                DO UPDATE SET data = EXCLUDED.data, updated_at = now()
+                """,
+                (chat_id, Jsonb(payload)),
+            )
+
+    def get(self, chat_id: int) -> Game | None:
+        return self._games.get(chat_id)
+
+    def put(self, game: Game) -> None:
+        self._games[game.chat_id] = game
+        try:
+            self._persist(game.chat_id, game)
+        except Exception:
+            logger.exception("Failed to persist last-match snapshot to Postgres")
+
+
+def build_last_match_store(database_url: str, state_file: Path):
+    if database_url:
+        logger.info("Using Postgres last-match store")
+        return PostgresLastMatchStore(database_url)
+    path = state_file.with_name("last_match.json")
+    logger.info("Using JSON last-match store at %s", path)
+    return JsonLastMatchStore(path)
+
 
 def build_profile_store(database_url: str, state_file: Path):
     """Mirror of ``build_store`` for the LifetimeProfile table."""
@@ -498,6 +641,7 @@ def build_store(database_url: str, state_file: Path):
 # Backwards-compat alias — keep `GameStore` name for callers that imported it.
 GameStore = JsonGameStore
 ProfileStore = JsonProfileStore
+LastMatchStore = JsonLastMatchStore
 
 
 def record_profiles_for_match(store: "ProfileStore", game: Game) -> None:
@@ -521,6 +665,7 @@ def record_profiles_for_match(store: "ProfileStore", game: Game) -> None:
             player,
             is_winner=(game.winner is not None and player.team_id == game.winner),
             when=when,
+            chat_id=game.chat_id,
         )
         store.put(profile)
     game.profiles_recorded = True

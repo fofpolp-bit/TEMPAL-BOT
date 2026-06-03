@@ -19,6 +19,7 @@ from .common import (
     fmt_player_name,
     format_scoreboard,
     get_context,
+    is_group_owner_or_admin,
 )
 from .keyboards import TARGET_SCORE_OPTIONS, lobby_keyboard
 
@@ -40,17 +41,30 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     await message.answer(
         "🕰️ <b>Команды бота</b>\n\n"
+        "<b>Лобби и матч</b>\n"
         "• /newgame — открыть лобби (только в группе)\n"
         "• /join — войти в лобби\n"
         "• /leave — выйти из лобби\n"
         "• /myteam A|B — выбрать команду вручную\n"
-        "• /startgame — стартануть матч (минимум 2+2 игрока)\n"
-        "• /act — открыть меню действий в свой ход\n"
-        "• /status — текущее состояние матча\n"
+        "• /spare [A|B] — стать запасным\n"
+        "• /shuffle — пересобрать команды (хозяин)\n"
+        "• /startgame — стартануть матч\n"
+        "• /act — меню действий в свой ход\n\n"
+        "<b>Инфо</b>\n"
+        "• /status — состояние раунда\n"
         "• /score — счёт\n"
-        "• /card [@user] — показать темпоральный паспорт\n"
-        "• /pause /resume — пауза и продолжение (владелец группы)\n"
-        "• /endgame — закончить матч и показать хронику\n",
+        "• /zone — текущая зона арены\n"
+        "• /card [reply] — карточка матча\n"
+        "• /profile [reply] — лайфтайм-карточка игрока\n"
+        "• /top [score|bronzes] — топ-10 чата\n"
+        "• /history — последний завершённый матч\n"
+        "• /coinflip — рандомно A или B\n\n"
+        "<b>Управление (хозяин лобби / владелец группы)</b>\n"
+        "• /pause /resume — пауза и продолжение\n"
+        "• /skip — переобъявить текущий раунд\n"
+        "• /kick [reply] — выгнать игрока из лобби\n"
+        "• /forcepass [reply] — форсить пас зависшему игроку\n"
+        "• /endgame — закончить матч",
         parse_mode="HTML",
     )
 
@@ -508,3 +522,129 @@ async def cmd_startgame(message: Message, bot: Bot, **kwargs) -> None:
             return None
 
     await cb_start(FakeCall(message), bot, **kwargs)  # type: ignore[arg-type]
+
+
+# ── /kick, /spare, /shuffle ──────────────────────────────────────────
+
+
+@router.message(Command("kick"))
+async def cmd_kick(message: Message, bot: Bot, **kwargs) -> None:
+    """Owner / group admin can kick someone from the lobby by replying
+    to that user's message with /kick."""
+    ctx: BotContext = get_context(kwargs)
+    game = ctx.store.get(message.chat.id)
+    if not game or game.status is not GameStatus.LOBBY:
+        await message.answer("Кикать можно только в открытом лобби.")
+        return
+    if not (message.reply_to_message and message.reply_to_message.from_user):
+        await message.answer(
+            "Ответь /kick на сообщение игрока, которого нужно выгнать из лобби."
+        )
+        return
+    allowed = (
+        message.from_user.id == game.owner_id
+        or await is_group_owner_or_admin(bot, message.chat.id, message.from_user.id)
+    )
+    if not allowed:
+        await message.answer("Только владелец группы или создатель лобби.")
+        return
+    target = message.reply_to_message.from_user
+    if target.id == game.owner_id:
+        await message.answer("Создателя лобби кикать нельзя — пусть отменит сам.")
+        return
+    if not game.remove_player(target.id):
+        await message.answer("Этого игрока в лобби нет.")
+        return
+    ctx.store.put(game)
+    await message.answer(
+        f"🚪 {fmt_player_name(target.full_name)} выгнан(а) из лобби."
+    )
+
+
+@router.message(Command("spare"))
+async def cmd_spare(message: Message, **kwargs) -> None:
+    """Toggle the caller's spare status in the current team.
+
+    /spare — toggle on current team; /spare A or /spare B — become spare
+    on that specific team.
+    """
+    ctx: BotContext = get_context(kwargs)
+    game = ctx.store.get(message.chat.id)
+    if not game or game.status is not GameStatus.LOBBY:
+        await message.answer("/spare работает только в открытом лобби.")
+        return
+
+    parts = (message.text or "").split()
+    explicit_team: TeamId | None = None
+    if len(parts) >= 2:
+        letter = parts[1].upper()
+        if letter not in {"A", "B", "Б"}:
+            await message.answer("Используй /spare, /spare A или /spare B.")
+            return
+        explicit_team = TeamId.A if letter == "A" else TeamId.B
+
+    player = game.players.get(message.from_user.id) or game.add_player(
+        message.from_user.id, message.from_user.full_name
+    )
+    target_team = explicit_team or player.team_id
+    if target_team is None:
+        await message.answer(
+            "Сначала выбери команду (/myteam A или /myteam B), потом /spare."
+        )
+        return
+
+    # Pull out of both teams' rosters and reserve lists first.
+    for tid in (TeamId.A, TeamId.B):
+        game.teams[tid].player_ids = [
+            pid for pid in game.teams[tid].player_ids if pid != player.user_id
+        ]
+        game.reserves[tid] = [
+            pid for pid in game.reserves[tid] if pid != player.user_id
+        ]
+
+    if player.is_spare and explicit_team is None:
+        # Toggle: was spare, become regular on same team.
+        player.is_spare = False
+        player.team_id = target_team
+        if player.user_id not in game.teams[target_team].player_ids:
+            game.teams[target_team].player_ids.append(player.user_id)
+        ctx.store.put(game)
+        await message.answer(
+            f"{fmt_player_name(player.name)} возвращается в основной состав "
+            f"{TEAM_LABEL[target_team]}."
+        )
+        return
+
+    player.team_id = target_team
+    player.is_spare = True
+    game.reserves[target_team].append(player.user_id)
+    ctx.store.put(game)
+    await message.answer(
+        f"🪑 {fmt_player_name(player.name)} теперь в запасе {TEAM_LABEL[target_team]}."
+    )
+
+
+@router.message(Command("shuffle"))
+async def cmd_shuffle(message: Message, bot: Bot, **kwargs) -> None:
+    """Reshuffle teams in lobby (owner / group admin only)."""
+    ctx: BotContext = get_context(kwargs)
+    game = ctx.store.get(message.chat.id)
+    if not game or game.status is not GameStatus.LOBBY:
+        await message.answer("Перетасовать можно только в открытом лобби.")
+        return
+    allowed = (
+        message.from_user.id == game.owner_id
+        or await is_group_owner_or_admin(bot, message.chat.id, message.from_user.id)
+    )
+    if not allowed:
+        await message.answer(
+            "Только владелец группы или создатель лобби может пересобрать команды."
+        )
+        return
+    if not game.players:
+        await message.answer("В лобби пока никого нет — нечего тасовать.")
+        return
+    _shuffle_teams(game)
+    ctx.store.put(game)
+    await _send_lobby(message, game)
+    await message.answer("🎲 Команды перетасованы.")

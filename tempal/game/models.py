@@ -56,6 +56,10 @@ class LifetimeProfile:
     total_times_fully_frozen: int = 0
     # Number of times each achievement_id was earned across matches.
     achievement_counts: dict[str, int] = field(default_factory=dict)
+    # Chat ids where this player has at least one finished match.
+    # Used to scope /top to a single chat. Empty for legacy profiles
+    # recorded before this field existed — those show up in any chat.
+    chat_ids: list[int] = field(default_factory=list)
     last_updated: float = 0.0
 
 
